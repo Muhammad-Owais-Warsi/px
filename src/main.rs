@@ -591,8 +591,12 @@ fn update() -> Result<(), String> {
 
     let bat_content = format!(
         "@echo off\r\n\
-         ping -n 2 127.0.0.1 >nul\r\n\
-         copy /Y \"{new_s}\" \"{me_s}\" >nul\r\n\
+         ping -n 4 127.0.0.1 >nul\r\n\
+         copy /Y \"{new_s}\" \"{me_s}\" >nul 2>&1\r\n\
+         if errorlevel 1 (\r\n\
+           ping -n 4 127.0.0.1 >nul\r\n\
+           copy /Y \"{new_s}\" \"{me_s}\" >nul 2>&1\r\n\
+         )\r\n\
          start \"\" \"{me_s}\"\r\n\
          del /f /q \"{cleanup}\\px.exe\" >nul 2>&1\r\n\
          del /f /q \"%~f0\" >nul 2>&1\r\n",
