@@ -1,0 +1,37 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/px.exe -DestinationPath px-windows-x86_64.zip
+          $hash = (Get-FileHash px-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  px-windows-x86_64.zip" | Out-File -Encoding ascii px-windows-x86_64.zip.sha256
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} `
+            --title "${{ github.ref_name }}" `
+            --generate-notes `
+            px-windows-x86_64.zip `
+            px-windows-x86_64.zip.sha256
