@@ -20,7 +20,7 @@ enum Cmd {
     /// List installed apps with size
     Apps,
     /// Uninstall px itself
-    SelfUninstall,
+    Destroy,
 }
 
 fn main() -> ExitCode {
@@ -35,7 +35,7 @@ fn main() -> ExitCode {
         Cmd::Un { apps } => un(&apps),
         Cmd::Cp { file } => cp(&file),
         Cmd::Apps => apps(),
-        Cmd::SelfUninstall => self_uninstall(),
+        Cmd::Destroy => destroy(),
     };
 
     match err {
@@ -393,7 +393,7 @@ fn human_size(bytes: u64) -> String {
 
 // ---------- small helper ----------
 
-fn self_uninstall() -> Result<(), String> {
+fn destroy() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|_| "can't find own path")?;
     let dir = exe.parent().ok_or("can't find own directory")?;
 
