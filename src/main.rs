@@ -19,6 +19,8 @@ enum Cmd {
     Cp { file: PathBuf },
     /// List installed apps with size
     Apps,
+    /// Uninstall px itself
+    SelfUninstall,
 }
 
 fn main() -> ExitCode {
@@ -33,6 +35,7 @@ fn main() -> ExitCode {
         Cmd::Un { apps } => un(&apps),
         Cmd::Cp { file } => cp(&file),
         Cmd::Apps => apps(),
+        Cmd::SelfUninstall => self_uninstall(),
     };
 
     match err {
@@ -389,6 +392,59 @@ fn human_size(bytes: u64) -> String {
 }
 
 // ---------- small helper ----------
+
+fn self_uninstall() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|_| "can't find own path")?;
+    let dir = exe.parent().ok_or("can't find own directory")?;
+
+    // Remove from PATH if installed to %LOCALAPPDATA%\px\bin.
+    let local_px = std::env::var("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join("px").join("bin"))
+        .ok();
+
+    if let Some(ref px_dir) = local_px {
+        if dir == px_dir.as_path() {
+            let user_path = std::env::var("Path").unwrap_or_default();
+            let new_path: Vec<&str> = user_path
+                .split(';')
+                .filter(|p| {
+                    let norm = p.trim_end_matches('\\').to_lowercase();
+                    norm != px_dir.to_string_lossy().to_lowercase()
+                })
+                .collect();
+            std::process::Command::new("reg")
+                .args([
+                    "add",
+                    "HKCU\\Environment",
+                    "/v",
+                    "Path",
+                    "/t",
+                    "REG_EXPAND_SZ",
+                    "/d",
+                    &new_path.join(";"),
+                    "/f",
+                ])
+                .status()
+                .map_err(|_| "can't update PATH")?;
+        }
+    }
+    // Can't delete a running exe. Write a temp script, run it detached, then exit.
+    let path_str = exe.to_string_lossy().to_string();
+    let bat = format!(
+        "@echo off\r\nping -n 2 127.0.0.1 >nul\r\ndel /f /q \"{}\"\r\n",
+        path_str
+    );
+    let bat_path = std::env::temp_dir().join(format!("px_cleanup_{}.bat", std::process::id()));
+    std::fs::write(&bat_path, bat).map_err(|_| "can't write cleanup script")?;
+    Command::new("cmd")
+        .args(["/C", "start", "", "/min", "cmd", "/C", &bat_path.to_string_lossy()])
+        .spawn()
+        .map_err(|_| "can't schedule deletion")?;
+
+    println!("px uninstalled");
+    std::process::exit(0);
+}
 
 fn clean_io(e: std::io::Error) -> String {
     use std::io::ErrorKind::*;
