@@ -12,13 +12,19 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Delete files/folders (parallel)
-    Del { paths: Vec<PathBuf> },
+    Rm { paths: Vec<PathBuf> },
     /// Uninstall apps by name
     Un { apps: Vec<String> },
     /// Copy file content to clipboard
     Cp { file: PathBuf },
     /// List installed apps with size
     Apps,
+    /// List active ports and services
+    Ports,
+    /// Kill process on a port
+    Kill { port: u16 },
+    /// Update px to latest version
+    Update,
     /// Uninstall px itself
     Destroy,
 }
@@ -31,10 +37,13 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let err = match cli.command {
-        Cmd::Del { paths } => del(&paths),
+        Cmd::Rm { paths } => rm(&paths),
         Cmd::Un { apps } => un(&apps),
         Cmd::Cp { file } => cp(&file),
         Cmd::Apps => apps(),
+        Cmd::Ports => ports(),
+        Cmd::Kill { port } => kill_port(port),
+        Cmd::Update => update(),
         Cmd::Destroy => destroy(),
     };
 
@@ -47,14 +56,13 @@ fn main() -> ExitCode {
     }
 }
 
-// ---------- del ----------
+// ---------- rm ----------
 
-fn del(paths: &[PathBuf]) -> Result<(), String> {
+fn rm(paths: &[PathBuf]) -> Result<(), String> {
     if paths.is_empty() {
-        return Err("del: give at least one path".into());
+        return Err("rm: give at least one path".into());
     }
 
-    // Parallel deletes with std threads only.
     let mut failed = 0;
     std::thread::scope(|s| {
         let mut jobs = Vec::new();
@@ -62,7 +70,7 @@ fn del(paths: &[PathBuf]) -> Result<(), String> {
             jobs.push(s.spawn(|| delete_one(p)));
         }
         for (p, r) in paths.iter().zip(jobs) {
-            if let Err(msg) = r.join().unwrap_or(Err("del: thread failed".into())) {
+            if let Err(msg) = r.join().unwrap_or(Err("rm: thread failed".into())) {
                 eprintln!("px: {}: {}", p.display(), msg);
                 failed += 1;
             }
@@ -70,7 +78,7 @@ fn del(paths: &[PathBuf]) -> Result<(), String> {
     });
 
     if failed > 0 {
-        return Err(format!("del: {failed} path(s) failed"));
+        return Err(format!("rm: {failed} path(s) failed"));
     }
     Ok(())
 }
@@ -297,6 +305,133 @@ fn msi_to_uninstall(cmd: &str) -> String {
     }
 }
 
+// ---------- ports ----------
+
+fn ports() -> Result<(), String> {
+    let output = Command::new("netstat")
+        .args(["-ano"])
+        .output()
+        .map_err(|_| "can't run netstat")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Collect unique (port, proto, pid) for LISTENING entries.
+    let mut seen = std::collections::HashSet::new();
+    let mut entries: Vec<(u16, String, String)> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        let is_tcp = line.starts_with("TCP");
+        let is_udp = line.starts_with("UDP");
+        if !is_tcp && !is_udp {
+            continue;
+        }
+        // TCP lines must say LISTENING; UDP always counts.
+        if is_tcp && !line.contains("LISTENING") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let proto = parts[0].to_uppercase();
+        let addr = parts[1];
+        let pid = parts[parts.len() - 1].to_string();
+        let port = match addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        if seen.insert((port, proto.clone(), pid.clone())) {
+            entries.push((port, proto, pid));
+        }
+    }
+
+    if entries.is_empty() {
+        return Err("ports: nothing listening".into());
+    }
+
+    // Resolve PID → process name via tasklist once.
+    let tasklist = Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    let mut pid_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in tasklist.lines() {
+        // "svchost.exe","1234","Services","0","1,234 K"  — split on ","
+        let trimmed = line.trim();
+        let fields: Vec<&str> = trimmed.split("\",\"").collect();
+        if fields.len() >= 2 {
+            let name = fields[0].trim_matches('"');
+            let pid = fields[1].trim_matches('"');
+            if !name.is_empty() && !pid.is_empty() {
+                pid_name.insert(pid.to_string(), name.to_string());
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let port_w = entries.iter().map(|(p, _, _)| p.to_string().len()).max().unwrap_or(5).max(5);
+    println!("{:<port_w$}  PROTO  PID      PROCESS", "PORT", port_w = port_w);
+    for (port, proto, pid) in &entries {
+        let name = pid_name.get(pid.as_str()).map(|s| s.as_str()).unwrap_or("-");
+        println!("{:<port_w$}  {:<6} {:<8} {}", port, proto, pid, name, port_w = port_w);
+    }
+    Ok(())
+}
+
+fn kill_port(port: u16) -> Result<(), String> {
+    let output = Command::new("netstat")
+        .args(["-ano"])
+        .output()
+        .map_err(|_| "can't run netstat")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let pids: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("TCP") && !line.starts_with("UDP") {
+                return None;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            let addr = parts[1];
+            let pid = parts[parts.len() - 1];
+            let p = addr.rsplit(':').next()?;
+            if p.parse::<u16>().ok()? == port {
+                Some(pid)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if pids.is_empty() {
+        return Err(format!("kill: nothing on port {port}"));
+    }
+
+    let mut killed = 0;
+    for pid in &pids {
+        let status = Command::new("taskkill")
+            .args(["/F", "/PID", pid])
+            .status();
+        if let Ok(s) = status {
+            if s.success() {
+                killed += 1;
+            }
+        }
+    }
+
+    if killed == 0 {
+        return Err(format!("kill: couldn't kill process on port {port}"));
+    }
+    Ok(())
+}
+
 // ---------- apps ----------
 
 fn apps() -> Result<(), String> {
@@ -392,6 +527,90 @@ fn human_size(bytes: u64) -> String {
 }
 
 // ---------- small helper ----------
+
+// ---------- update ----------
+
+const REPO: &str = "Muhammad-Owais-Warsi/px";
+
+fn update() -> Result<(), String> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("px {current}");
+
+    let mut resp = ureq::get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+        .header("User-Agent", "px")
+        .call()
+        .map_err(|_| "update: can't reach github")?;
+    let body = resp.body_mut();
+    let json_str = body.read_to_string().map_err(|_| "update: bad response")?;
+    let body: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|_| "update: bad response")?;
+    let tag = body["tag_name"]
+        .as_str()
+        .ok_or("update: no tag in response")?;
+    let version = tag.trim_start_matches('v');
+
+    if version == current {
+        println!("already up to date");
+        return Ok(());
+    }
+
+    println!("updating to {version}...");
+
+    let asset = "px-windows-x86_64.zip";
+    let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}");
+    let tmp = std::env::temp_dir().join(format!("px-update-{version}"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|_| "update: can't create temp dir")?;
+    let zip = tmp.join(asset);
+
+    let mut resp = ureq::get(&url)
+        .header("User-Agent", "px")
+        .call()
+        .map_err(|_| "update: download failed")?;
+    let bytes = resp
+        .body_mut()
+        .read_to_vec()
+        .map_err(|_| "update: download failed")?;
+    std::fs::write(&zip, bytes).map_err(|_| "update: can't write zip")?;
+
+    let zip_file = std::fs::File::open(&zip).map_err(|_| "update: can't open zip")?;
+    let mut archive = zip::ZipArchive::new(zip_file).map_err(|_| "update: bad zip")?;
+    archive
+        .extract(tmp.join("bin"))
+        .map_err(|_| "update: can't extract zip")?;
+
+    let new_exe = tmp.join("bin").join("px.exe");
+    if !new_exe.exists() {
+        return Err("update: px.exe not found in archive".into());
+    }
+
+    let me = std::env::current_exe().map_err(|_| "update: can't find own path")?;
+    let me_s = me.to_string_lossy();
+    let new_s = new_exe.to_string_lossy();
+    let cleanup = new_exe.parent().unwrap().to_string_lossy();
+
+    let bat_content = format!(
+        "@echo off\r\n\
+         ping -n 2 127.0.0.1 >nul\r\n\
+         copy /Y \"{new_s}\" \"{me_s}\" >nul\r\n\
+         start \"\" \"{me_s}\"\r\n\
+         del /f /q \"{cleanup}\\px.exe\" >nul 2>&1\r\n\
+         del /f /q \"%~f0\" >nul 2>&1\r\n",
+    );
+    let bat = std::env::temp_dir().join(format!("px_update_{}.bat", std::process::id()));
+    std::fs::write(&bat, bat_content).map_err(|_| "update: can't write script")?;
+    let bat_s = bat.to_string_lossy();
+
+    Command::new("cmd")
+        .args(["/C", "start", "", "/min", "cmd", "/C", &bat_s])
+        .spawn()
+        .map_err(|_| "update: can't launch updater")?;
+
+    println!("updated to {version}");
+    std::process::exit(0);
+}
+
+// ---------- destroy ----------
 
 fn destroy() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|_| "can't find own path")?;
